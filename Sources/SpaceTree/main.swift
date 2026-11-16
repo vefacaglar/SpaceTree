@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Darwin
 
 struct FileNode: Identifiable, Sendable {
     let url: URL
@@ -14,6 +15,7 @@ struct ScanResult: Sendable {
     let root: FileNode
     let skipped: Int
     let files: Int
+    let excluded: Int
 }
 
 final class Scanner: @unchecked Sendable {
@@ -21,40 +23,78 @@ final class Scanner: @unchecked Sendable {
     private var cancelled = false
     private var skipped = 0
     private var files = 0
+    private var excluded = 0
+    private var rootDevice: dev_t = 0
     private let progress: @Sendable (Int, String) -> Void
     init(progress: @escaping @Sendable (Int, String) -> Void) { self.progress = progress }
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
     private var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
 
+    private static let cloudPaths: [String] = {
+        let library = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library").path
+        return [library + "/Mobile Documents", library + "/CloudStorage"]
+    }()
+
+    static func isCloudPath(_ path: String) -> Bool {
+        cloudPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    static func isAllowedRoot(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        guard !isCloudPath(path) else { return false }
+        var fs = statfs()
+        guard statfs(path, &fs) == 0, fs.f_flags & UInt32(MNT_LOCAL) != 0 else { return false }
+        let mount = withUnsafePointer(to: &fs.f_mntonname) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+        return mount != "/Volumes" && !mount.hasPrefix("/Volumes/")
+    }
+
     func scan(_ url: URL) -> ScanResult? {
+        var info = stat()
+        guard Self.isAllowedRoot(url), lstat(url.path, &info) == 0 else { return nil }
+        rootDevice = info.st_dev
         guard let root = walk(url), !isCancelled else { return nil }
-        return ScanResult(root: root, skipped: skipped, files: files)
+        return ScanResult(root: root, skipped: skipped, files: files, excluded: excluded)
     }
 
     private func walk(_ url: URL) -> FileNode? {
         if isCancelled { return nil }
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .isPackageKey]
-        guard let values = try? url.resourceValues(forKeys: keys) else { skipped += 1; return nil }
+        let path = url.path
+        var info = stat()
+        guard lstat(path, &info) == 0 else { skipped += 1; return nil }
+        if info.st_dev != rootDevice { excluded += 1; return nil }
+        let type = info.st_mode & mode_t(S_IFMT)
         // Never follow symbolic links; this prevents cycles and crossing into other accounts.
-        if values.isSymbolicLink == true { return nil }
-        guard values.isDirectory == true else {
+        if type == mode_t(S_IFLNK) { return nil }
+        if type == mode_t(S_IFDIR), Self.isCloudPath(path) { excluded += 1; return nil }
+        guard type == mode_t(S_IFDIR) else {
             files += 1
-            if files % 500 == 0 { progress(files, url.deletingLastPathComponent().path) }
-            return FileNode(url: url, size: Int64(values.fileSize ?? 0), isDirectory: false, children: nil)
+            if files % 1000 == 0 { progress(files, url.deletingLastPathComponent().path) }
+            return FileNode(url: url, size: max(0, info.st_size), isDirectory: false, children: nil)
         }
-        let entries: [URL]
-        do {
-            entries = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: Array(keys), options: [])
-        } catch {
+        guard let directory = opendir(url.path) else {
             skipped += 1
             return FileNode(url: url, size: 0, isDirectory: true, children: nil)
         }
+        defer { closedir(directory) }
         var children: [FileNode] = []
         var total: Int64 = 0
-        for entry in entries {
-            if isCancelled { return nil }
-            if let child = walk(entry) { children.append(child); total += child.size }
+        while !isCancelled {
+            errno = 0
+            guard let entry = readdir(directory) else {
+                if errno != 0 { skipped += 1 }
+                break
+            }
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(validatingCString: $0) }
+            }
+            guard let name else { skipped += 1; continue }
+            if name == "." || name == ".." { continue }
+            let childURL = url.appendingPathComponent(name)
+            if let child = walk(childURL) { children.append(child); total += child.size }
         }
+        if isCancelled { return nil }
         children.sort { $0.size > $1.size }
         return FileNode(url: url, size: total, isDirectory: true, children: children.isEmpty ? nil : children)
     }
@@ -78,6 +118,10 @@ final class Scanner: @unchecked Sendable {
         if panel.runModal() == .OK, let url = panel.url { start(url) }
     }
     func start(_ url: URL) {
+        guard Scanner.isAllowedRoot(url) else {
+            status = "Cloud folders and external or network volumes are excluded."
+            return
+        }
         scanner?.cancel()
         let id = UUID(); scanID = id
         result = nil; selected = nil; scanning = true; status = "Scanning \(url.path)…"
@@ -95,7 +139,7 @@ final class Scanner: @unchecked Sendable {
                 self.scanning = false; self.scanner = nil
                 self.result = result
                 if let result {
-                    self.status = "\(result.files.formatted()) files scanned" + (result.skipped > 0 ? " · \(result.skipped.formatted()) items could not be read" : "")
+                    self.status = "\(result.files.formatted()) files scanned" + (result.skipped > 0 ? " · \(result.skipped.formatted()) items could not be read" : "") + (result.excluded > 0 ? " · \(result.excluded.formatted()) cloud folders or volumes excluded" : "")
                 } else { self.status = "Scan cancelled." }
             }
         }
